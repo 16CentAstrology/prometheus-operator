@@ -16,18 +16,30 @@ package operator
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	typedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/client/versioned/scheme"
+)
+
+const (
+	PrometheusOperatorFieldManager = "PrometheusOperator"
+
+	InvalidConfigurationEvent = "InvalidConfiguration"
 )
 
 var (
@@ -92,7 +104,7 @@ func (rt *ReconciliationTracker) SetStatus(k string, err error) {
 
 // GetStatus returns the last reconciliation status for the given object.
 // The second value indicates whether the object is known or not.
-func (rt *ReconciliationTracker) GetStatus(k string) (ReconciliationStatus, bool) {
+func (rt *ReconciliationTracker) getStatus(k string) (ReconciliationStatus, bool) {
 	rt.mtx.Lock()
 	defer rt.mtx.Unlock()
 
@@ -102,6 +114,34 @@ func (rt *ReconciliationTracker) GetStatus(k string) (ReconciliationStatus, bool
 	}
 
 	return s, true
+}
+
+// GetCondition returns a monitoringv1.Condition for the last-known
+// reconciliation status of the given object.
+func (rt *ReconciliationTracker) GetCondition(k string, gen int64) monitoringv1.Condition {
+	condition := monitoringv1.Condition{
+		Type:   monitoringv1.Reconciled,
+		Status: monitoringv1.ConditionTrue,
+		LastTransitionTime: metav1.Time{
+			Time: time.Now().UTC(),
+		},
+		ObservedGeneration: gen,
+	}
+
+	reconciliationStatus, found := rt.getStatus(k)
+	if !found {
+		condition.Status = monitoringv1.ConditionUnknown
+		condition.Reason = "NotFound"
+		condition.Message = fmt.Sprintf("object %q not found", k)
+	} else {
+		if !reconciliationStatus.Ok() {
+			condition.Status = monitoringv1.ConditionFalse
+		}
+		condition.Reason = reconciliationStatus.Reason()
+		condition.Message = reconciliationStatus.Message()
+	}
+
+	return condition
 }
 
 // ForgetObject removes the given object from the tracker.
@@ -131,6 +171,8 @@ func (rt *ReconciliationTracker) Collect(ch chan<- prometheus.Metric) {
 	for _, st := range rt.statusByObject {
 		if st.Ok() {
 			ok++
+		} else {
+			failed++
 		}
 	}
 
@@ -223,6 +265,21 @@ func NewMetrics(r prometheus.Registerer) *Metrics {
 	)
 
 	return &m
+}
+
+type EventRecorderFactory func(client kubernetes.Interface, component string) record.EventRecorder
+
+func NewEventRecorderFactory(emitEvents bool) EventRecorderFactory {
+	return func(client kubernetes.Interface, component string) record.EventRecorder {
+		eventBroadcaster := record.NewBroadcaster()
+		eventBroadcaster.StartStructuredLogging(0)
+
+		if emitEvents {
+			eventBroadcaster.StartRecordingToSink(&typedv1.EventSinkImpl{Interface: client.CoreV1().Events("")})
+		}
+
+		return eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: component})
+	}
 }
 
 // StsDeleteCreateCounter returns a counter to track statefulset's recreations.
@@ -373,7 +430,7 @@ func SanitizeSTS(sts *appsv1.StatefulSet) {
 // than 1 minute, it means that something is stuck and the message will
 // indicate to the admin which informer is the culprit.
 // See https://github.com/prometheus-operator/prometheus-operator/issues/3347.
-func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger log.Logger, inf cache.SharedIndexInformer) bool {
+func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger *slog.Logger, inf cache.SharedIndexInformer) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -384,7 +441,7 @@ func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger lo
 		for {
 			select {
 			case <-t.C:
-				level.Warn(logger).Log("msg", "cache sync not yet completed")
+				logger.Warn("cache sync not yet completed")
 			case <-ctx.Done():
 				return
 			}
@@ -393,9 +450,9 @@ func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger lo
 
 	ok := cache.WaitForNamedCacheSync(controllerName, ctx.Done(), inf.HasSynced)
 	if !ok {
-		level.Error(logger).Log("msg", "failed to sync cache")
+		logger.Error("failed to sync cache")
 	} else {
-		level.Debug(logger).Log("msg", "successfully synced cache")
+		logger.Debug("successfully synced cache")
 	}
 
 	return ok

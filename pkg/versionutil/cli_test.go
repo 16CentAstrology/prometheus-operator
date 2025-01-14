@@ -51,7 +51,8 @@ func TestShouldPrintVersion(t *testing.T) {
 					"  build user:       test-value\n"+
 					"  build date:       test-value\n"+
 					"  go version:       test-value\n"+
-					"  platform:         "+runtime.GOOS+"/"+runtime.GOARCH, program),
+					"  platform:         "+runtime.GOOS+"/"+runtime.GOARCH+"\n"+
+					"  tags:             unknown", program),
 		},
 	}
 	for tn, tc := range tests {
@@ -66,7 +67,7 @@ func TestShouldPrintVersion(t *testing.T) {
 			// when
 			versionutil.RegisterParseFlags()
 			// then
-			assert.Equal(t, true, versionutil.ShouldPrintVersion())
+			assert.True(t, versionutil.ShouldPrintVersion())
 
 			// when
 			var buf bytes.Buffer

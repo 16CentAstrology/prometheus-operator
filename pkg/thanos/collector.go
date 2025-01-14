@@ -15,9 +15,10 @@
 package thanos
 
 import (
-	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/tools/cache"
+
+	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 var (
@@ -35,7 +36,7 @@ type thanosRulerCollector struct {
 	stores []cache.Store
 }
 
-// newThanosRulerCollectorForStores creates a thanosRulerCollector initialized with the given cache store
+// newThanosRulerCollectorForStores creates a thanosRulerCollector initialized with the given cache store.
 func newThanosRulerCollectorForStores(s ...cache.Store) *thanosRulerCollector {
 	return &thanosRulerCollector{stores: s}
 }

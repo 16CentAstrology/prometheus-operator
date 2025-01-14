@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	dockerref "github.com/docker/distribution/reference"
+	ref "github.com/distribution/reference"
 )
 
 // BuildImagePath builds a container image path based on
@@ -31,12 +31,12 @@ func BuildImagePath(specImage, baseImage, version, tag, sha string) (string, err
 	if strings.TrimSpace(specImage) != "" {
 		return specImage, nil
 	}
-	named, err := dockerref.ParseNormalizedNamed(baseImage)
+	named, err := ref.ParseNormalizedNamed(baseImage)
 	if err != nil {
 		return "", fmt.Errorf("couldn't parse image reference %q: %v", baseImage, err)
 	}
-	_, isTagged := named.(dockerref.Tagged)
-	_, isDigested := named.(dockerref.Digested)
+	_, isTagged := named.(ref.Tagged)
+	_, isDigested := named.(ref.Digested)
 	if isTagged || isDigested {
 		return baseImage, nil
 	}
@@ -44,7 +44,7 @@ func BuildImagePath(specImage, baseImage, version, tag, sha string) (string, err
 	if sha != "" {
 		return fmt.Sprintf("%s@sha256:%s", baseImage, sha), nil
 	} else if tag != "" {
-		imageTag, err := dockerref.WithTag(named, tag)
+		imageTag, err := ref.WithTag(named, tag)
 		if err != nil {
 			return "", err
 		}
@@ -56,6 +56,14 @@ func BuildImagePath(specImage, baseImage, version, tag, sha string) (string, err
 	return baseImage + ":" + version, nil
 }
 
+// BuildImagePathForAgent builds a container image path based on
+// the given parameters for Prometheus Agent.
+// Return specImage if not empty.
+// Otherwise a combination of baseImage and version.
+func BuildImagePathForAgent(specImage, baseImage, version string) (string, error) {
+	return BuildImagePath(specImage, baseImage, version, "", "")
+}
+
 // StringValOrDefault returns the default val if the
 // given string is empty/whitespace.
 // Otherwise returns the value of the string..
@@ -64,14 +72,4 @@ func StringValOrDefault(val, defaultVal string) string {
 		return defaultVal
 	}
 	return val
-}
-
-// StringPtrValOrDefault returns the default val if the
-// given string pointer is nil points to an empty/whitespace string.
-// Otherwise returns the value of the string.
-func StringPtrValOrDefault(val *string, defaultVal string) string {
-	if val == nil {
-		return defaultVal
-	}
-	return StringValOrDefault(*val, defaultVal)
 }

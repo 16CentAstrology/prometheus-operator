@@ -15,8 +15,9 @@
 package informers
 
 import (
-	"github.com/pkg/errors"
-	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
+	"fmt"
+	"sort"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -24,6 +25,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
 )
 
 // InformLister is the interface that both exposes a shared index informer
@@ -37,7 +40,7 @@ type InformLister interface {
 // FactoriesForNamespaces is a way to combine several shared informers into a single struct with unified listing power.
 type FactoriesForNamespaces interface {
 	ForResource(namespace string, resource schema.GroupVersionResource) (InformLister, error)
-	Namespaces() sets.String
+	Namespaces() sets.Set[string]
 }
 
 // ForResource contains a slice of InformLister for a concrete resource type,
@@ -53,13 +56,24 @@ type ForResource struct {
 // It takes a namespace aware informer factory, wrapped in a FactoriesForNamespaces interface
 // that is able to instantiate an informer for a given namespace.
 func NewInformersForResource(ifs FactoriesForNamespaces, resource schema.GroupVersionResource) (*ForResource, error) {
-	namespaces := ifs.Namespaces().List()
-	var informers []InformLister
+	return NewInformersForResourceWithTransform(ifs, resource, nil)
+}
+
+func NewInformersForResourceWithTransform(ifs FactoriesForNamespaces, resource schema.GroupVersionResource, handler cache.TransformFunc) (*ForResource, error) {
+	namespaces := ifs.Namespaces().UnsortedList()
+	sort.Strings(namespaces)
+
+	informers := make([]InformLister, 0, len(namespaces))
 
 	for _, ns := range namespaces {
 		informer, err := ifs.ForResource(ns, resource)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error getting informer in namespace %q for resource %v", ns, resource)
+			return nil, fmt.Errorf("error getting informer in namespace %q for resource %v: %w", ns, resource, err)
+		}
+		if handler != nil {
+			if err := informer.Informer().SetTransform(handler); err != nil {
+				return nil, fmt.Errorf("error setting transform in namespace %q for resource %v: %w", ns, resource, err)
+			}
 		}
 		informers = append(informers, informer)
 	}
@@ -67,6 +81,35 @@ func NewInformersForResource(ifs FactoriesForNamespaces, resource schema.GroupVe
 	return &ForResource{
 		informers: informers,
 	}, nil
+}
+
+// PartialObjectMetadataStrip removes the following fields from PartialObjectMetadata objects:
+// * Annotations
+// * Labels
+// * ManagedFields
+// * Finalizers
+// * OwnerReferences.
+//
+// If the passed object isn't of type *v1.PartialObjectMetadata, it is returned unmodified.
+//
+// It matches the cache.TransformFunc type and can be used by informers
+// watching PartialObjectMetadata objects to reduce memory consumption.
+// See https://pkg.go.dev/k8s.io/client-go@v0.29.1/tools/cache#TransformFunc for details.
+func PartialObjectMetadataStrip(obj interface{}) (interface{}, error) {
+	partialMeta, ok := obj.(*v1.PartialObjectMetadata)
+	if !ok {
+		// Don't do anything if the cast isn't successful.
+		// The object might be of type "cache.DeletedFinalStateUnknown".
+		return obj, nil
+	}
+
+	partialMeta.Annotations = nil
+	partialMeta.Labels = nil
+	partialMeta.ManagedFields = nil
+	partialMeta.Finalizers = nil
+	partialMeta.OwnerReferences = nil
+
+	return partialMeta, nil
 }
 
 // Start starts all underlying informers, passing the given stop channel to each of them.
@@ -84,7 +127,7 @@ func (w *ForResource) GetInformers() []InformLister {
 // AddEventHandler registers the given handler to all wrapped informers.
 func (w *ForResource) AddEventHandler(handler cache.ResourceEventHandler) {
 	for _, i := range w.informers {
-		i.Informer().AddEventHandler(handler)
+		_, _ = i.Informer().AddEventHandler(handler)
 	}
 }
 

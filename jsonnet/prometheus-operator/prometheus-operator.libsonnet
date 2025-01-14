@@ -5,6 +5,12 @@ local defaults = {
   version: error 'must provide version',
   image: error 'must provide image',
   configReloaderImage: error 'must provide configReloaderImage',
+  configReloaderResources: {
+    limits: { cpu: '', memory: '' },
+    requests: { cpu: '', memory: '' },
+  },
+  enableReloaderProbes: false,
+  goGC: '30',
   port: 8080,
   resources: {
     limits: { cpu: '200m', memory: '200Mi' },
@@ -21,6 +27,9 @@ local defaults = {
     if !std.setMember(labelName, ['app.kubernetes.io/version'])
   },
   enableAlertmanagerConfigV1beta1: false,
+  kubeletService: 'kube-system/kubelet',
+  kubeletEndpointsEnabled: true,
+  kubeletEndpointSliceEnabled: false,
 };
 
 function(params) {
@@ -33,12 +42,14 @@ function(params) {
                                                  if po.config.enableAlertmanagerConfigV1beta1 then
                                                    (import 'alertmanagerconfigs-v1beta1-crd.libsonnet')
                                                  else {},
+  '0prometheusagentCustomResourceDefinition': import 'prometheusagents-crd.json',
   '0prometheusCustomResourceDefinition': import 'prometheuses-crd.json',
   '0servicemonitorCustomResourceDefinition': import 'servicemonitors-crd.json',
   '0podmonitorCustomResourceDefinition': import 'podmonitors-crd.json',
   '0probeCustomResourceDefinition': import 'probes-crd.json',
   '0prometheusruleCustomResourceDefinition': import 'prometheusrules-crd.json',
   '0thanosrulerCustomResourceDefinition': import 'thanosrulers-crd.json',
+  '0scrapeconfigCustomResourceDefinition': import 'scrapeconfigs-crd.json',
 
   clusterRoleBinding: {
     apiVersion: 'rbac.authorization.k8s.io/v1',
@@ -67,79 +78,134 @@ function(params) {
       labels: po.config.commonLabels,
     },
     rules: [
-      {
-        apiGroups: ['monitoring.coreos.com'],
-        resources: [
-          'alertmanagers',
-          'alertmanagers/finalizers',
-          'alertmanagerconfigs',
-          'prometheuses',
-          'prometheuses/finalizers',
-          'prometheuses/status',
-          'thanosrulers',
-          'thanosrulers/finalizers',
-          'servicemonitors',
-          'podmonitors',
-          'probes',
-          'prometheusrules',
-        ],
-        verbs: ['*'],
-      },
-      {
-        apiGroups: ['apps'],
-        resources: ['statefulsets'],
-        verbs: ['*'],
-      },
-      {
-        apiGroups: [''],
-        resources: ['configmaps', 'secrets'],
-        verbs: ['*'],
-      },
-      {
-        apiGroups: [''],
-        resources: ['pods'],
-        verbs: ['list', 'delete'],
-      },
-      {
-        apiGroups: [''],
-        resources: [
-          'services',
-          'services/finalizers',
-          'endpoints',
-        ],
-        verbs: ['get', 'create', 'update', 'delete'],
-      },
-      {
-        apiGroups: [''],
-        resources: ['nodes'],
-        verbs: ['list', 'watch'],
-      },
-      {
-        apiGroups: [''],
-        resources: ['namespaces'],
-        verbs: ['get', 'list', 'watch'],
-      },
-      {
-        apiGroups: ['networking.k8s.io'],
-        resources: ['ingresses'],
-        verbs: ['get', 'list', 'watch'],
-      },
-    ],
+             {
+               apiGroups: ['monitoring.coreos.com'],
+               resources: [
+                 'alertmanagers',
+                 'alertmanagers/finalizers',
+                 'alertmanagers/status',
+                 'alertmanagerconfigs',
+                 'prometheuses',
+                 'prometheuses/finalizers',
+                 'prometheuses/status',
+                 'prometheusagents',
+                 'prometheusagents/finalizers',
+                 'prometheusagents/status',
+                 'thanosrulers',
+                 'thanosrulers/finalizers',
+                 'thanosrulers/status',
+                 'scrapeconfigs',
+                 'servicemonitors',
+                 'podmonitors',
+                 'probes',
+                 'prometheusrules',
+               ],
+               verbs: ['*'],
+             },
+             {
+               apiGroups: ['apps'],
+               resources: ['statefulsets'],
+               verbs: ['*'],
+             },
+             {
+               apiGroups: [''],
+               resources: ['configmaps', 'secrets'],
+               verbs: ['*'],
+             },
+             {
+               apiGroups: [''],
+               resources: ['pods'],
+               verbs: ['list', 'delete'],
+             },
+             {
+               apiGroups: [''],
+               resources: [
+                 'services',
+                 'services/finalizers',
+               ],
+               verbs: ['get', 'create', 'update', 'delete'],
+             },
+             {
+               apiGroups: [''],
+               resources: ['nodes'],
+               verbs: ['list', 'watch'],
+             },
+             {
+               apiGroups: [''],
+               resources: ['namespaces'],
+               verbs: ['get', 'list', 'watch'],
+             },
+             {
+               apiGroups: [''],
+               resources: ['events'],
+               verbs: ['patch', 'create'],
+             },
+             {
+               apiGroups: ['networking.k8s.io'],
+               resources: ['ingresses'],
+               verbs: ['get', 'list', 'watch'],
+             },
+             {
+               apiGroups: ['storage.k8s.io'],
+               resources: ['storageclasses'],
+               verbs: ['get'],
+             },
+           ] + (
+             if po.config.kubeletEndpointsEnabled then
+               [
+                 {
+                   apiGroups: [''],
+                   resources: [
+                     'endpoints',
+                   ],
+                   verbs: ['get', 'create', 'update', 'delete'],
+                 },
+               ]
+             else
+               []
+           )
+           + (
+             if po.config.kubeletEndpointSliceEnabled then
+               [
+                 {
+                   apiGroups: ['discovery.k8s.io'],
+                   resources: [
+                     'endpointslices',
+                   ],
+                   verbs: ['get', 'create', 'list', 'update', 'delete'],
+                 },
+               ]
+             else
+               []
+           ),
   },
 
   deployment:
+    local reloaderResourceArg(arg, value) =
+      if value != '' then [arg + '=' + value] else [];
+    local enableReloaderProbesArg(value) =
+      if value == true then ['--enable-config-reloader-probes=true'] else [];
+
     local container = {
       name: po.config.name,
       image: po.config.image,
       args: [
-        '--kubelet-service=kube-system/kubelet',
-        '--prometheus-config-reloader=' + po.config.configReloaderImage,
-      ],
+              '--kubelet-service=' + po.config.kubeletService,
+              '--prometheus-config-reloader=' + po.config.configReloaderImage,
+            ] +
+            [std.format('--kubelet-endpoints=%s', po.config.kubeletEndpointsEnabled)] +
+            [std.format('--kubelet-endpointslice=%s', po.config.kubeletEndpointSliceEnabled)] +
+            reloaderResourceArg('--config-reloader-cpu-limit', po.config.configReloaderResources.limits.cpu) +
+            reloaderResourceArg('--config-reloader-memory-limit', po.config.configReloaderResources.limits.memory) +
+            reloaderResourceArg('--config-reloader-cpu-request', po.config.configReloaderResources.requests.cpu) +
+            reloaderResourceArg('--config-reloader-memory-request', po.config.configReloaderResources.requests.memory) +
+            enableReloaderProbesArg(po.config.enableReloaderProbes),
       ports: [{
         containerPort: po.config.port,
         name: 'http',
       }],
       resources: po.config.resources,
+      env: [{ name: 'GOGC', value: po.config.goGC }],
       securityContext: {
         allowPrivilegeEscalation: false,
         readOnlyRootFilesystem: true,
@@ -173,6 +239,7 @@ function(params) {
             securityContext: {
               runAsNonRoot: true,
               runAsUser: 65534,
+              seccompProfile: { type: 'RuntimeDefault' },
             },
             serviceAccountName: po.config.name,
             automountServiceAccountToken: true,

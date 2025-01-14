@@ -15,10 +15,11 @@
 package listwatch
 
 import (
+	"log/slog"
+	"math"
+	"os"
 	"reflect"
 	"testing"
-
-	"github.com/go-kit/log"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -34,11 +35,11 @@ type mockListerWatcher struct {
 	stopped    bool
 }
 
-func (m *mockListerWatcher) List(options metav1.ListOptions) (runtime.Object, error) {
+func (m *mockListerWatcher) List(_ metav1.ListOptions) (runtime.Object, error) {
 	return m.listResult, nil
 }
 
-func (m *mockListerWatcher) Watch(options metav1.ListOptions) (watch.Interface, error) {
+func (m *mockListerWatcher) Watch(_ metav1.ListOptions) (watch.Interface, error) {
 	return m, nil
 }
 
@@ -77,7 +78,12 @@ func namespaces(ns ...string) map[string]struct{} {
 }
 
 func TestDenylistList(t *testing.T) {
-	logger := log.NewNopLogger()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		// slog level math.MaxInt means no logging
+		// We would like to use the slog buil-in No-op level once it is available
+		// More: https://github.com/golang/go/issues/62005
+		Level: slog.Level(math.MaxInt),
+	}))
 
 	cases := []struct {
 		name           string
@@ -203,7 +209,12 @@ func TestDenylistList(t *testing.T) {
 }
 
 func TestDenylistWatch(t *testing.T) {
-	logger := log.NewNopLogger()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		// slog level math.MaxInt means no logging
+		// We would like to use the slog buil-in No-op level once it is available
+		// More: https://github.com/golang/go/issues/62005
+		Level: slog.Level(math.MaxInt),
+	}))
 
 	cases := []struct {
 		name           string

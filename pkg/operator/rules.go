@@ -15,57 +15,235 @@
 package operator
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
-	"github.com/ghodss/yaml"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
+	"github.com/blang/semver/v4"
 	"github.com/prometheus/prometheus/model/rulefmt"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	thanostypes "github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/prometheus-operator/prometheus-operator/pkg/informers"
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
+	namespacelabeler "github.com/prometheus-operator/prometheus-operator/pkg/namespacelabeler"
 )
 
-func GenerateRulesConfiguration(promRule monitoringv1.PrometheusRuleSpec, logger log.Logger) (string, error) {
-	content, err := yaml.Marshal(promRule)
+type RuleConfigurationFormat int
+
+const (
+	PrometheusFormat RuleConfigurationFormat = iota
+	ThanosFormat
+)
+
+// The maximum `Data` size of a ConfigMap seems to differ between
+// environments. This is probably due to different meta data sizes which count
+// into the overall maximum size of a ConfigMap. Thereby lets leave a
+// large buffer.
+var MaxConfigMapDataSize = int(float64(v1.MaxSecretSize) * 0.5)
+
+type PrometheusRuleSelector struct {
+	ruleFormat   RuleConfigurationFormat
+	version      semver.Version
+	ruleSelector labels.Selector
+	nsLabeler    *namespacelabeler.Labeler
+	ruleInformer *informers.ForResource
+
+	eventRecorder record.EventRecorder
+
+	logger *slog.Logger
+}
+
+func NewPrometheusRuleSelector(ruleFormat RuleConfigurationFormat, version string, labelSelector *metav1.LabelSelector, nsLabeler *namespacelabeler.Labeler, ruleInformer *informers.ForResource, eventRecorder record.EventRecorder, logger *slog.Logger) (*PrometheusRuleSelector, error) {
+	componentVersion, err := semver.ParseTolerant(version)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to marshal content")
+		return nil, fmt.Errorf("failed to parse version: %w", err)
 	}
-	errs := ValidateRule(promRule)
+
+	ruleSelector, err := metav1.LabelSelectorAsSelector(labelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("convert rule label selector to selector: %w", err)
+	}
+
+	return &PrometheusRuleSelector{
+		ruleFormat:    ruleFormat,
+		version:       componentVersion,
+		ruleSelector:  ruleSelector,
+		nsLabeler:     nsLabeler,
+		ruleInformer:  ruleInformer,
+		eventRecorder: eventRecorder,
+		logger:        logger,
+	}, nil
+}
+
+func (prs *PrometheusRuleSelector) generateRulesConfiguration(promRule *monitoringv1.PrometheusRule) (string, error) {
+	logger := prs.logger.With("prometheusrule", promRule.Name, "prometheusrule-namespace", promRule.Namespace)
+	promRuleSpec := promRule.Spec
+
+	promRuleSpec = prs.sanitizePrometheusRulesSpec(promRuleSpec, logger)
+
+	content, err := yaml.Marshal(promRuleSpec)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal content: %w", err)
+	}
+
+	errs := ValidateRule(promRuleSpec)
 	if len(errs) != 0 {
 		const m = "Invalid rule"
-		level.Debug(logger).Log("msg", m, "content", content)
+		logger.Debug(m, "content", content)
 		for _, err := range errs {
-			level.Info(logger).Log("msg", m, "err", err)
+			logger.Info(m, "err", err)
 		}
 		return "", errors.New(m)
 	}
+
 	return string(content), nil
 }
 
-// ValidateRule takes PrometheusRuleSpec and validates it using the upstream prometheus rule validator.
-func ValidateRule(promRule monitoringv1.PrometheusRuleSpec) []error {
-	for i, group := range promRule.Groups {
-		if group.PartialResponseStrategy == "" {
-			continue
-		}
-		// TODO(slashpai): Remove this validation after v0.65 since this is handled at CRD level
-		if _, ok := thanostypes.PartialResponseStrategy_value[strings.ToUpper(group.PartialResponseStrategy)]; !ok {
-			return []error{
-				fmt.Errorf("invalid partial_response_strategy %s value", group.PartialResponseStrategy),
-			}
+// sanitizePrometheusRulesSpec sanitizes the PrometheusRules spec depending on the Prometheus/Thanos version.
+func (prs *PrometheusRuleSelector) sanitizePrometheusRulesSpec(promRuleSpec monitoringv1.PrometheusRuleSpec, logger *slog.Logger) monitoringv1.PrometheusRuleSpec {
+	minVersionKeepFiringFor := semver.MustParse("2.42.0")
+	minVersionLimits := semver.MustParse("2.31.0")
+	minVersionQueryOffset := semver.MustParse("2.53.0")
+	minVersionRuleGroupLabels := semver.MustParse("3.0.0")
+	component := "Prometheus"
+
+	if prs.ruleFormat == ThanosFormat {
+		minVersionKeepFiringFor = semver.MustParse("0.34.0")
+		minVersionLimits = semver.MustParse("0.24.0")
+		minVersionQueryOffset = semver.MustParse("100.0.0")     // Arbitrary very high major version because it's not yet supported by Thanos.
+		minVersionRuleGroupLabels = semver.MustParse("100.0.0") // Arbitrary very high major version because it's not yet supported by Thanos.
+		component = "Thanos"
+	}
+
+	for i := range promRuleSpec.Groups {
+		if promRuleSpec.Groups[i].Limit != nil && prs.version.LT(minVersionLimits) {
+			promRuleSpec.Groups[i].Limit = nil
+			logger.Warn(fmt.Sprintf("ignoring `limit` not supported by %s", component), "minimum_version", minVersionLimits)
 		}
 
-		// reset this as the upstream prometheus rule validator
-		// is not aware of the partial_response_strategy field.
-		promRule.Groups[i].PartialResponseStrategy = ""
+		if promRuleSpec.Groups[i].QueryOffset != nil && prs.version.LT(minVersionQueryOffset) {
+			promRuleSpec.Groups[i].QueryOffset = nil
+			logger.Warn(fmt.Sprintf("ignoring `query_offset` not supported by %s", component), "minimum_version", minVersionQueryOffset)
+		}
+
+		if prs.ruleFormat == PrometheusFormat {
+			// Unset partialResponseStrategy field.
+			promRuleSpec.Groups[i].PartialResponseStrategy = ""
+		}
+
+		if len(promRuleSpec.Groups[i].Labels) > 0 && prs.version.LT(minVersionRuleGroupLabels) {
+			promRuleSpec.Groups[i].Labels = nil
+			logger.Warn(fmt.Sprintf("ignoring group labels since not supported by %s", component), "minimum_version", minVersionRuleGroupLabels)
+		}
+
+		for j := range promRuleSpec.Groups[i].Rules {
+			if promRuleSpec.Groups[i].Rules[j].KeepFiringFor != nil && prs.version.LT(minVersionKeepFiringFor) {
+				promRuleSpec.Groups[i].Rules[j].KeepFiringFor = nil
+				logger.Warn(fmt.Sprintf("ignoring 'keep_firing_for' not supported by %s", component), "minimum_version", minVersionKeepFiringFor)
+			}
+		}
 	}
-	content, err := yaml.Marshal(promRule)
+
+	return promRuleSpec
+}
+
+// ValidateRule takes PrometheusRuleSpec and validates it using the upstream prometheus rule validator.
+func ValidateRule(promRuleSpec monitoringv1.PrometheusRuleSpec) []error {
+	for i := range promRuleSpec.Groups {
+		// The upstream Prometheus rule validator doesn't support the
+		// partial_response_strategy field.
+		promRuleSpec.Groups[i].PartialResponseStrategy = ""
+
+		// Empty durations need to be translated to nil to be omitted from the
+		// YAML ouptut otherwise the generated configuration will not be valid.
+		if promRuleSpec.Groups[i].Interval != nil && *promRuleSpec.Groups[i].Interval == "" {
+			promRuleSpec.Groups[i].Interval = nil
+		}
+
+		for j := range promRuleSpec.Groups[i].Rules {
+			if ptr.Deref(promRuleSpec.Groups[i].Rules[j].For, "") == "" {
+				promRuleSpec.Groups[i].Rules[j].For = nil
+			}
+		}
+	}
+
+	content, err := yaml.Marshal(promRuleSpec)
 	if err != nil {
-		return []error{errors.Wrap(err, "failed to marshal content")}
+		return []error{fmt.Errorf("failed to marshal content: %w", err)}
 	}
+
+	// Check if the serialized rules exceed our internal limit.
+	promRuleSize := len(content)
+	if promRuleSize > MaxConfigMapDataSize {
+		return []error{fmt.Errorf("the length of rendered Prometheus Rule is %d bytes which is above the maximum limit of %d bytes", promRuleSize, MaxConfigMapDataSize)}
+	}
+
 	_, errs := rulefmt.Parse(content)
 	return errs
+}
+
+// Select selects PrometheusRules and translates them into native Prometheus/Thanos configurations.
+// The second returned value is the number of rejected PrometheusRule objects.
+func (prs *PrometheusRuleSelector) Select(namespaces []string) (map[string]string, int, error) {
+	promRules := map[string]*monitoringv1.PrometheusRule{}
+
+	for _, ns := range namespaces {
+		err := prs.ruleInformer.ListAllByNamespace(ns, prs.ruleSelector, func(obj interface{}) {
+			promRule := obj.(*monitoringv1.PrometheusRule).DeepCopy()
+			if err := k8sutil.AddTypeInformationToObject(promRule); err != nil {
+				prs.logger.Error("failed to set rule type information", "namespace", ns, "err", err)
+				return
+			}
+
+			promRules[fmt.Sprintf("%v-%v-%v.yaml", promRule.Namespace, promRule.Name, promRule.UID)] = promRule
+		})
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to list prometheus rules in namespace %s: %w", ns, err)
+		}
+	}
+
+	var rejected int
+	rules := make(map[string]string, len(promRules))
+
+	for ruleName, promRule := range promRules {
+		var err error
+		var content string
+		if err := prs.nsLabeler.EnforceNamespaceLabel(promRule); err != nil {
+			continue
+		}
+
+		content, err = prs.generateRulesConfiguration(promRule)
+		if err != nil {
+			rejected++
+			prs.logger.Warn(
+				"skipping prometheusrule",
+				"error", err.Error(),
+				"prometheusrule", promRule.Name,
+				"namespace", promRule.Namespace,
+			)
+			prs.eventRecorder.Eventf(promRule, v1.EventTypeWarning, "InvalidConfiguration", "PrometheusRule %s was rejected due to invalid configuration: %v", promRule.Name, err)
+			continue
+		}
+
+		rules[ruleName] = content
+	}
+
+	ruleNames := []string{}
+	for name := range rules {
+		ruleNames = append(ruleNames, name)
+	}
+
+	prs.logger.Debug(
+		"selected Rules",
+		"rules", strings.Join(ruleNames, ","),
+	)
+
+	return rules, rejected, nil
 }

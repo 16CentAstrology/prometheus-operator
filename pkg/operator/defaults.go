@@ -14,119 +14,83 @@
 
 package operator
 
-import "github.com/prometheus/common/version"
+import (
+	"strings"
+
+	"github.com/prometheus/common/version"
+)
 
 const (
-	// DefaultAlertmanagerVersion is a default image tag for the prometheus alertmanager
-	DefaultAlertmanagerVersion = "v0.24.0"
-	// DefaultAlertmanagerBaseImage is a base container registry address for the prometheus alertmanager
+	// DefaultAlertmanagerVersion is a default image tag for the prometheus alertmanager.
+	DefaultAlertmanagerVersion = "v0.27.0"
+	// DefaultAlertmanagerBaseImage is a base container registry address for the prometheus alertmanager.
 	DefaultAlertmanagerBaseImage = "quay.io/prometheus/alertmanager"
-	// DefaultAlertmanagerImage is a default image pulling address for the prometheus alertmanager
+	// DefaultAlertmanagerImage is a default image pulling address for the prometheus alertmanager.
 	DefaultAlertmanagerImage = DefaultAlertmanagerBaseImage + ":" + DefaultAlertmanagerVersion
 
-	// DefaultThanosVersion is a default image tag for the Thanos long-term prometheus storage collector
-	DefaultThanosVersion = "v0.29.0"
+	// DefaultThanosVersion is a default image tag for the Thanos long-term prometheus storage collector.
+	DefaultThanosVersion = "v0.37.2"
 	// DefaultThanosBaseImage is a base container registry address for the Thanos long-term prometheus
-	// storage collector
+	// storage collector.
 	DefaultThanosBaseImage = "quay.io/thanos/thanos"
-	// DefaultThanosImage is a default image pulling address for the Thanos long-term prometheus storage collector
+	// DefaultThanosImage is a default image pulling address for the Thanos long-term prometheus storage collector.
 	DefaultThanosImage = DefaultThanosBaseImage + ":" + DefaultThanosVersion
 )
 
 var (
-	// DefaultPrometheusVersion is a default image tag for the prometheus
+	// DefaultPrometheusVersion is a default image tag for the prometheus.
 	DefaultPrometheusVersion = PrometheusCompatibilityMatrix[len(PrometheusCompatibilityMatrix)-1]
-	// DefaultPrometheusBaseImage is a base container registry address for the prometheus
+	// DefaultPrometheusV2 is latest version of Prometheus v2.
+	DefaultPrometheusV2 = getLatestPrometheusV2()
+	// DefaultPrometheusBaseImage is a base container registry address for the prometheus.
 	DefaultPrometheusBaseImage = "quay.io/prometheus/prometheus"
-	// DefaultPrometheusImage is a default image pulling address for the prometheus
+	// DefaultPrometheusImage is a default image pulling address for the prometheus.
 	DefaultPrometheusImage = DefaultPrometheusBaseImage + ":" + DefaultPrometheusVersion
 
 	// DefaultPrometheusConfigReloaderImage is an image that will be used as a sidecar to provide dynamic prometheus
-	// configuration reloading
+	// configuration reloading.
 	DefaultPrometheusConfigReloaderImage = "quay.io/prometheus-operator/prometheus-config-reloader:v" + version.Version
 
-	// PrometheusCompatibilityMatrix is a list of supported prometheus version
+	// PrometheusCompatibilityMatrix is a list of supported prometheus versions.
+	// prometheus-operator end-to-end tests verify that the operator can deploy from the current LTS version to the latest stable release.
+	// This list should be updated every time a new LTS is released.
 	PrometheusCompatibilityMatrix = []string{
-		"v2.0.0",
-		"v2.2.1",
-		"v2.3.1",
-		"v2.3.2",
-		"v2.4.0",
-		"v2.4.1",
-		"v2.4.2",
-		"v2.4.3",
-		"v2.5.0",
-		"v2.6.0",
-		"v2.6.1",
-		"v2.7.0",
-		"v2.7.1",
-		"v2.7.2",
-		"v2.8.1",
-		"v2.9.2",
-		"v2.10.0",
-		"v2.11.0",
-		"v2.14.0",
-		"v2.15.2",
-		"v2.16.0",
-		"v2.17.2",
-		"v2.18.0",
-		"v2.18.1",
-		"v2.18.2",
-		"v2.19.0",
-		"v2.19.1",
-		"v2.19.2",
-		"v2.19.3",
-		"v2.20.0",
-		"v2.20.1",
-		"v2.21.0",
-		"v2.22.0",
-		"v2.22.1",
-		"v2.22.2",
-		"v2.23.0",
-		"v2.24.0",
-		"v2.24.1",
-		"v2.25.0",
-		"v2.25.1",
-		"v2.25.2",
-		"v2.26.0",
-		"v2.26.1",
-		"v2.27.0",
-		"v2.27.1",
-		"v2.28.0",
-		"v2.28.1",
-		"v2.29.0",
-		"v2.29.1",
-		"v2.30.0",
-		"v2.30.1",
-		"v2.30.2",
-		"v2.30.3",
-		"v2.31.0",
-		"v2.31.1",
-		"v2.32.0",
-		"v2.32.1",
-		"v2.33.0",
-		"v2.33.1",
-		"v2.33.2",
-		"v2.33.3",
-		"v2.33.4",
-		"v2.33.5",
-		"v2.34.0",
-		"v2.35.0",
-		"v2.36.0",
-		"v2.37.0",
-		"v2.37.1",
-		"v2.37.2",
-		"v2.37.3",
-		"v2.37.4",
-		"v2.38.0",
-		"v2.39.0",
-		"v2.39.1",
-		"v2.39.2",
-		"v2.40.0",
-		"v2.40.1",
-		"v2.40.2",
-		"v2.40.3",
-		"v2.40.4",
-		"v2.40.5",
+		"v2.45.0",
+		"v2.46.0",
+		"v2.47.0",
+		"v2.47.1",
+		"v2.47.2",
+		"v2.48.0",
+		"v2.48.1",
+		"v2.49.0",
+		"v2.49.1",
+		"v2.50.0",
+		"v2.50.1",
+		"v2.51.0",
+		"v2.51.1",
+		"v2.51.2",
+		"v2.52.0",
+		// The v2.52.1 image tag is missing from docker.io and quay.io registries.
+		"v2.53.0",
+		"v2.53.1",
+		"v2.53.2",
+		"v2.53.3",
+		"v2.54.0",
+		"v2.54.1",
+		"v2.55.0",
+		"v2.55.1",
+		"v3.0.0",
+		"v3.0.1",
+		"v3.1.0",
 	}
 )
+
+func getLatestPrometheusV2() string {
+	for i, version := range PrometheusCompatibilityMatrix {
+		// Since last v2 version would be one just before the first v3 version
+		if strings.HasPrefix(version, "v3") {
+			return PrometheusCompatibilityMatrix[i-1]
+		}
+	}
+	panic("failed to find a v2.x entry in the compatibility matrix")
+}

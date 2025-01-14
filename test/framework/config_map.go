@@ -16,18 +16,16 @@ package framework
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
-
-	"github.com/pkg/errors"
 )
 
-func MakeConfigMapWithCert(kubeClient kubernetes.Interface, ns, name, keyKey, certKey, caKey string,
+func MakeConfigMapWithCert(ns, name, keyKey, certKey, caKey string,
 	keyBytes, certBytes, caBytes []byte) *v1.ConfigMap {
 
 	cm := &v1.ConfigMap{
@@ -52,7 +50,7 @@ func MakeConfigMapWithCert(kubeClient kubernetes.Interface, ns, name, keyKey, ce
 
 func (f *Framework) WaitForConfigMapExist(ctx context.Context, ns, name string) (*v1.ConfigMap, error) {
 	var configMap *v1.ConfigMap
-	err := wait.Poll(2*time.Second, f.DefaultTimeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, f.DefaultTimeout, false, func(ctx context.Context) (bool, error) {
 		var err error
 		configMap, err = f.
 			KubeClient.
@@ -69,11 +67,14 @@ func (f *Framework) WaitForConfigMapExist(ctx context.Context, ns, name string) 
 		return true, nil
 	})
 
-	return configMap, errors.Wrapf(err, "waiting for ConfigMap '%v' in namespace '%v'", name, ns)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for ConfigMap '%v' in namespace '%v': %w", name, ns, err)
+	}
+	return configMap, nil
 }
 
 func (f *Framework) WaitForConfigMapNotExist(ctx context.Context, ns, name string) error {
-	err := wait.Poll(2*time.Second, f.DefaultTimeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, f.DefaultTimeout, false, func(ctx context.Context) (bool, error) {
 		var err error
 		_, err = f.
 			KubeClient.
@@ -90,5 +91,8 @@ func (f *Framework) WaitForConfigMapNotExist(ctx context.Context, ns, name strin
 		return false, nil
 	})
 
-	return errors.Wrapf(err, "waiting for ConfigMap '%v' in namespace '%v' to not exist", name, ns)
+	if err != nil {
+		return fmt.Errorf("waiting for ConfigMap '%v' in namespace '%v' to not exist: %w", name, ns, err)
+	}
+	return nil
 }

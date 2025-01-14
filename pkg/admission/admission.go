@@ -18,24 +18,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	v1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	kscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
+
 	validationv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/validation/v1alpha1"
 	validationv1beta1 "github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/validation/v1beta1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 	monitoringv1beta1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1beta1"
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/operator"
-	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
-
-	v1 "k8s.io/api/admission/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kscheme "k8s.io/client-go/kubernetes/scheme"
 )
 
 const (
@@ -73,35 +72,20 @@ var (
 
 // Admission control for:
 // 1. PrometheusRules (validation, mutation) - ensuring created resources can be loaded by Promethues
-// 2. monitoringv1alpha1.AlertmanagerConfig (validation) - ensuring
+// 2. monitoringv1alpha1.AlertmanagerConfig (validation) - ensuring.
 type Admission struct {
-	promRuleValidationErrorsCounter    prometheus.Counter
-	promRuleValidationTriggeredCounter prometheus.Counter
-	amConfValidationErrorsCounter      prometheus.Counter
-	amConfValidationTriggeredCounter   prometheus.Counter
-	logger                             log.Logger
-	wh                                 *conversion.Webhook
+	logger *slog.Logger
+	wh     http.Handler
 }
 
-func New(logger log.Logger) *Admission {
+func New(logger *slog.Logger) *Admission {
 	scheme := runtime.NewScheme()
-
-	if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-
-	if err := monitoringv1beta1.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-
-	wh := &conversion.Webhook{}
-	if err := wh.InjectScheme(scheme); err != nil {
-		panic(fmt.Sprintf("failed to inject scheme into the webhook handler: %s", err))
-	}
+	utilruntime.Must(monitoringv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(monitoringv1beta1.AddToScheme(scheme))
 
 	return &Admission{
 		logger: logger,
-		wh:     wh,
+		wh:     conversion.NewWebhookHandler(scheme),
 	}
 }
 
@@ -110,18 +94,6 @@ func (a *Admission) Register(mux *http.ServeMux) {
 	mux.HandleFunc(prometheusRuleMutatePath, a.servePrometheusRulesMutate)
 	mux.HandleFunc(alertmanagerConfigValidatePath, a.serveAlertmanagerConfigValidate)
 	mux.HandleFunc(convertPath, a.serveConvert)
-}
-
-func (a *Admission) RegisterMetrics(
-	prometheusValidationTriggeredCounter,
-	prometheusValidationErrorsCounter,
-	alertManagerConfValidationTriggeredCounter,
-	alertManagerConfValidationErrorsCounter prometheus.Counter,
-) {
-	a.promRuleValidationTriggeredCounter = prometheusValidationTriggeredCounter
-	a.promRuleValidationErrorsCounter = prometheusValidationErrorsCounter
-	a.amConfValidationTriggeredCounter = alertManagerConfValidationTriggeredCounter
-	a.amConfValidationErrorsCounter = alertManagerConfValidationErrorsCounter
 }
 
 type admitFunc func(ar v1.AdmissionReview) *v1.AdmissionResponse
@@ -170,25 +142,25 @@ func (a *Admission) serveAdmission(w http.ResponseWriter, r *http.Request, admit
 	}
 
 	if len(body) == 0 {
-		level.Warn(a.logger).Log("msg", "request has no body")
+		a.logger.Warn("request has no body")
 		http.Error(w, "request has no body", http.StatusBadRequest)
 		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/json" {
-		level.Warn(a.logger).Log("msg", fmt.Sprintf("invalid Content-Type %s, want `application/json`", contentType))
+		a.logger.Warn(fmt.Sprintf("invalid Content-Type %s, want `application/json`", contentType))
 		http.Error(w, "invalid Content-Type, want `application/json`", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	level.Debug(a.logger).Log("msg", "Received request", "content", string(body))
+	a.logger.Debug("Received request", "content", string(body))
 
 	requestedAdmissionReview := v1.AdmissionReview{}
 	responseAdmissionReview := v1.AdmissionReview{}
 
 	if _, _, err := deserializer.Decode(body, nil, &requestedAdmissionReview); err != nil {
-		level.Warn(a.logger).Log("msg", "Unable to deserialize request", "err", err)
+		a.logger.Warn("Unable to deserialize request", "err", err)
 		responseAdmissionReview.Response = toAdmissionResponseFailure("Unable to deserialize request", "", []error{err})
 	} else {
 		responseAdmissionReview.Response = admit(requestedAdmissionReview)
@@ -200,36 +172,36 @@ func (a *Admission) serveAdmission(w http.ResponseWriter, r *http.Request, admit
 
 	respBytes, err := json.Marshal(responseAdmissionReview)
 
-	level.Debug(a.logger).Log("msg", "sending response", "content", string(respBytes))
+	a.logger.Debug("sending response", "content", string(respBytes))
 
 	if err != nil {
-		level.Error(a.logger).Log("msg", "Cannot serialize response", "err", err)
+		a.logger.Error("Cannot serialize response", "err", err)
 		http.Error(w, fmt.Sprintf("could not serialize response: %v", err), http.StatusInternalServerError)
 	}
 	if _, err := w.Write(respBytes); err != nil {
-		level.Error(a.logger).Log("msg", "Cannot write response", "err", err)
+		a.logger.Error("Cannot write response", "err", err)
 		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
 	}
 }
 
 func (a *Admission) mutatePrometheusRules(ar v1.AdmissionReview) *v1.AdmissionResponse {
-	level.Debug(a.logger).Log("msg", "Mutating prometheusrules")
+	a.logger.Debug("Mutating prometheusrules")
 
 	if ar.Request.Resource != prometheusRuleGVR {
 		err := fmt.Errorf("expected resource to be %v, but received %v", prometheusRuleResource, ar.Request.Resource)
-		level.Warn(a.logger).Log("err", err)
+		a.logger.Warn("", "err", err)
 		return toAdmissionResponseFailure("Unexpected resource kind", prometheusRuleResource, []error{err})
 	}
 
 	rule := &PrometheusRules{}
 	if err := json.Unmarshal(ar.Request.Object.Raw, rule); err != nil {
-		level.Info(a.logger).Log("msg", errUnmarshalAdmission, "err", err)
+		a.logger.Info(errUnmarshalAdmission, "err", err)
 		return toAdmissionResponseFailure(errUnmarshalAdmission, prometheusRuleResource, []error{err})
 	}
 
 	patches, err := generatePatchesForNonStringLabelsAnnotations(rule.Spec.Raw)
 	if err != nil {
-		level.Info(a.logger).Log("msg", errUnmarshalRules, "err", err)
+		a.logger.Info(errUnmarshalRules, "err", err)
 		return toAdmissionResponseFailure(errUnmarshalRules, prometheusRuleResource, []error{err})
 	}
 
@@ -247,32 +219,28 @@ func (a *Admission) mutatePrometheusRules(ar v1.AdmissionReview) *v1.AdmissionRe
 }
 
 func (a *Admission) validatePrometheusRules(ar v1.AdmissionReview) *v1.AdmissionResponse {
-	a.incrementCounter(a.promRuleValidationTriggeredCounter)
-	level.Debug(a.logger).Log("msg", "Validating prometheusrules")
+	a.logger.Debug("Validating prometheusrules")
 
 	if ar.Request.Resource != prometheusRuleGVR {
 		err := fmt.Errorf("expected resource to be %v, but received %v", prometheusRuleResource, ar.Request.Resource)
-		level.Warn(a.logger).Log("err", err)
-		a.incrementCounter(a.promRuleValidationErrorsCounter)
+		a.logger.Warn("", "err", err)
 		return toAdmissionResponseFailure("Unexpected resource kind", prometheusRuleResource, []error{err})
 	}
 
 	promRule := &monitoringv1.PrometheusRule{}
 	if err := json.Unmarshal(ar.Request.Object.Raw, promRule); err != nil {
-		level.Info(a.logger).Log("msg", errUnmarshalRules, "err", err)
-		a.incrementCounter(a.promRuleValidationErrorsCounter)
+		a.logger.Info(errUnmarshalRules, "err", err)
 		return toAdmissionResponseFailure(errUnmarshalRules, prometheusRuleResource, []error{err})
 	}
 
 	errors := promoperator.ValidateRule(promRule.Spec)
 	if len(errors) != 0 {
 		const m = "Invalid rule"
-		level.Debug(a.logger).Log("msg", m, "content", promRule.Spec)
+		a.logger.Debug(m, "content", promRule.Spec)
 		for _, err := range errors {
-			level.Info(a.logger).Log("msg", m, "err", err)
+			a.logger.Info(m, "err", err)
 		}
 
-		a.incrementCounter(a.promRuleValidationErrorsCounter)
 		return toAdmissionResponseFailure("Rules are not valid", prometheusRuleResource, errors)
 	}
 
@@ -280,14 +248,12 @@ func (a *Admission) validatePrometheusRules(ar v1.AdmissionReview) *v1.Admission
 }
 
 func (a *Admission) validateAlertmanagerConfig(ar v1.AdmissionReview) *v1.AdmissionResponse {
-	a.incrementCounter(a.amConfValidationTriggeredCounter)
-	level.Debug(a.logger).Log("msg", "Validating alertmanagerconfigs")
+	a.logger.Debug("Validating alertmanagerconfigs")
 
 	gr := metav1.GroupResource{Group: ar.Request.Resource.Group, Resource: ar.Request.Resource.Resource}
 	if gr != alertManagerConfigGR {
 		err := fmt.Errorf("expected resource to be %v, but received %v", alertManagerConfigResource, ar.Request.Resource)
-		level.Warn(a.logger).Log("err", err)
-		a.incrementCounter(a.amConfValidationErrorsCounter)
+		a.logger.Warn("", "err", err)
 		return toAdmissionResponseFailure("Unexpected resource kind", alertManagerConfigResource, []error{err})
 	}
 
@@ -303,8 +269,7 @@ func (a *Admission) validateAlertmanagerConfig(ar v1.AdmissionReview) *v1.Admiss
 	}
 
 	if err := json.Unmarshal(ar.Request.Object.Raw, amConf); err != nil {
-		level.Info(a.logger).Log("msg", errUnmarshalConfig, "err", err)
-		a.incrementCounter(a.amConfValidationErrorsCounter)
+		a.logger.Info(errUnmarshalConfig, "err", err)
 		return toAdmissionResponseFailure(errUnmarshalConfig, alertManagerConfigResource, []error{err})
 	}
 
@@ -320,21 +285,9 @@ func (a *Admission) validateAlertmanagerConfig(ar v1.AdmissionReview) *v1.Admiss
 
 	if err != nil {
 		msg := "invalid config"
-		level.Debug(a.logger).Log("msg", msg, "content", string(ar.Request.Object.Raw))
-		level.Info(a.logger).Log("msg", msg, "err", err)
-		a.incrementCounter(a.amConfValidationErrorsCounter)
+		a.logger.Debug(msg, "content", string(ar.Request.Object.Raw))
+		a.logger.Info(msg, "err", err)
 		return toAdmissionResponseFailure("AlertmanagerConfig is invalid", alertManagerConfigResource, []error{err})
 	}
 	return &v1.AdmissionResponse{Allowed: true}
-}
-
-// TODO (PhilipGough) - this can be removed when the following deprecated metrics are removed
-//   - prometheus_operator_rule_validation_triggered_total
-//   - prometheus_operator_rule_validation_errors_total
-//   - prometheus_operator_alertmanager_config_validation_errors_total
-//   - prometheus_operator_alertmanager_config_validation_triggered_total
-func (a *Admission) incrementCounter(counter prometheus.Counter) {
-	if counter != nil {
-		counter.Inc()
-	}
 }

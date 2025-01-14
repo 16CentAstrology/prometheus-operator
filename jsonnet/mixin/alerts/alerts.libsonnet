@@ -56,7 +56,21 @@
             },
             annotations: {
               description: '{{ $value | humanizePercentage }} of reconciling operations failed for {{ $labels.controller }} controller in {{ $labels.namespace }} namespace.',
-              summary: 'Errors while reconciling controller.',
+              summary: 'Errors while reconciling objects.',
+            },
+            'for': '10m',
+          },
+          {
+            alert: 'PrometheusOperatorStatusUpdateErrors',
+            expr: |||
+              (sum by (%(groupLabels)s) (rate(prometheus_operator_status_update_errors_total{%(prometheusOperatorSelector)s}[5m]))) / (sum by (%(groupLabels)s) (rate(prometheus_operator_status_update_operations_total{%(prometheusOperatorSelector)s}[5m]))) > 0.1
+            ||| % $._config,
+            labels: {
+              severity: 'warning',
+            },
+            annotations: {
+              description: '{{ $value | humanizePercentage }} of status update operations failed for {{ $labels.controller }} controller in {{ $labels.namespace }} namespace.',
+              summary: 'Errors while updating objects status.',
             },
             'for': '10m',
           },
@@ -116,8 +130,7 @@
               severity: 'warning',
             },
             annotations: {
-              description: 'Errors encountered while the {{$labels.pod}} config-reloader sidecar attempts to sync config in {{$labels.namespace}} namespace.
-As a result, configuration for service running in {{$labels.pod}} may be stale and cannot be updated anymore.',
+              description: 'Errors encountered while the {{$labels.pod}} config-reloader sidecar attempts to sync config in {{$labels.namespace}} namespace.\nAs a result, configuration for service running in {{$labels.pod}} may be stale and cannot be updated anymore.',
               summary: 'config-reloader sidecar has not had a successful reload for 10m',
             },
             'for': '10m',

@@ -24,34 +24,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/textparse"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
 
-	"github.com/pkg/errors"
 	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
-	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/model/textparse"
 )
 
 func SourceToIOReader(source string) (io.Reader, error) {
 	if strings.HasPrefix(source, "http") {
 		return URLToIOReader(source)
-	} else {
-		return PathToOSFile(source)
 	}
+	return PathToOSFile(source)
 }
 
 func PathToOSFile(relativePath string) (*os.File, error) {
 	path, err := filepath.Abs(relativePath)
 	if err != nil {
-		return nil, errors.Wrap(err, fmt.Sprintf("failed generate absolute file path of %s", relativePath))
+		return nil, fmt.Errorf("failed generate absolute file path of %s: %w", relativePath, err)
 	}
 
 	manifest, err := os.Open(path)
 	if err != nil {
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to open file %s", path))
+		return nil, fmt.Errorf("failed to open file %s: %w", path, err)
 	}
 
 	return manifest, nil
@@ -61,7 +59,7 @@ func URLToIOReader(url string) (io.Reader, error) {
 	var resp *http.Response
 	timeout := 30 * time.Second
 
-	err := wait.Poll(time.Second, timeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(_ context.Context) (bool, error) {
 		var err error
 		resp, err = http.Get(url)
 		if err == nil && resp.StatusCode == 200 {
@@ -71,11 +69,12 @@ func URLToIOReader(url string) (io.Reader, error) {
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, fmt.Sprintf(
-			"waiting for %v to return a successful status code timed out. Last response from server was: %v",
+		return nil, fmt.Errorf(
+			"waiting for %v to return a successful status code timed out. Last response from server was: %v: %w",
 			url,
 			resp,
-		))
+			err,
+		)
 	}
 
 	return resp.Body, nil
@@ -84,7 +83,7 @@ func URLToIOReader(url string) (io.Reader, error) {
 // WaitForPodsReady waits for a selection of Pods to be running and each
 // container to pass its readiness check.
 func (f *Framework) WaitForPodsReady(ctx context.Context, namespace string, timeout time.Duration, expectedReplicas int, opts metav1.ListOptions) error {
-	return wait.Poll(time.Second, timeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, time.Second, timeout, false, func(ctx context.Context) (bool, error) {
 		pl, err := f.KubeClient.CoreV1().Pods(namespace).List(ctx, opts)
 		if err != nil {
 			return false, err
@@ -94,7 +93,7 @@ func (f *Framework) WaitForPodsReady(ctx context.Context, namespace string, time
 		for _, p := range pl.Items {
 			isRunningAndReady, err := k8sutil.PodRunningAndReady(p)
 			if err != nil {
-				return false, err
+				return false, nil
 			}
 
 			if isRunningAndReady {
@@ -110,7 +109,7 @@ func (f *Framework) WaitForPodsReady(ctx context.Context, namespace string, time
 }
 
 func (f *Framework) WaitForPodsRunImage(ctx context.Context, namespace string, expectedReplicas int, image string, opts metav1.ListOptions) error {
-	return wait.Poll(time.Second, time.Minute*5, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, time.Second, time.Minute*5, false, func(ctx context.Context) (bool, error) {
 		pl, err := f.KubeClient.CoreV1().Pods(namespace).List(ctx, opts)
 		if err != nil {
 			return false, err
@@ -132,7 +131,7 @@ func (f *Framework) WaitForPodsRunImage(ctx context.Context, namespace string, e
 
 func WaitForHTTPSuccessStatusCode(timeout time.Duration, url string) error {
 	var resp *http.Response
-	err := wait.Poll(time.Second, timeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(_ context.Context) (bool, error) {
 		var err error
 		resp, err = http.Get(url)
 		if err == nil && resp.StatusCode == 200 {
@@ -141,11 +140,15 @@ func WaitForHTTPSuccessStatusCode(timeout time.Duration, url string) error {
 		return false, nil
 	})
 
-	return errors.Wrap(err, fmt.Sprintf(
-		"waiting for %v to return a successful status code timed out. Last response from server was: %v",
-		url,
-		resp,
-	))
+	if err != nil {
+		return fmt.Errorf(
+			"waiting for %v to return a successful status code timed out. Last response from server was: %v: %w",
+			url,
+			resp,
+			err,
+		)
+	}
+	return nil
 }
 
 func podRunsImage(p v1.Pod, image string) bool {
@@ -156,20 +159,6 @@ func podRunsImage(p v1.Pod, image string) bool {
 	}
 
 	return false
-}
-
-func (f *Framework) GetLogs(ctx context.Context, namespace string, podName, containerName string) (string, error) {
-	logs, err := f.KubeClient.CoreV1().RESTClient().Get().
-		Resource("pods").
-		Namespace(namespace).
-		Name(podName).SubResource("log").
-		Param("container", containerName).
-		Do(ctx).
-		Raw()
-	if err != nil {
-		return "", err
-	}
-	return string(logs), err
 }
 
 // ProxyGetPod expects resourceName as "[protocol:]podName[:portNameOrNumber]".
@@ -212,10 +201,13 @@ func (f *Framework) ProxyPostPod(namespace, resourceName, path, body string) *re
 
 // GetMetricVal get a particular metric value from a pod.
 // When portNumberOfName is "", default port will be used to access metrics endpoint.
-func (f *Framework) GetMetricVal(ctx context.Context, ns, podName, portNumberOrName, metricName string) (float64, error) {
+func (f *Framework) GetMetricVal(ctx context.Context, protocol, ns, podName, portNumberOrName, metricName string) (float64, error) {
 	resourceName := podName
+	if protocol == "" {
+		protocol = "http"
+	}
 	if portNumberOrName != "" {
-		resourceName = fmt.Sprintf("%s:%s", podName, portNumberOrName)
+		resourceName = fmt.Sprintf("%s:%s:%s", protocol, podName, portNumberOrName)
 	}
 
 	request := f.ProxyGetPod(ns, resourceName, "/metrics")
@@ -224,7 +216,7 @@ func (f *Framework) GetMetricVal(ctx context.Context, ns, podName, portNumberOrN
 		return 0, err
 	}
 
-	parser := textparse.NewPromParser(resp)
+	parser := textparse.NewPromParser(resp, labels.NewSymbolTable())
 	for {
 		entry, err := parser.Next()
 		if err != nil {
